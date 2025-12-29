@@ -387,6 +387,88 @@ def _safe_ascii(s: str) -> str:
 
 # ---------------- STATS PAGE RENDER HELPER ----------------
 
+from telethon.errors import UserNotParticipantError
+from telethon.errors.rpcerrorlist import ChatAdminRequiredError
+import asyncio
+
+async def reconcile_left_for_link(uid: int, invite_link_id: int, batch_limit: int = 300) -> tuple[int, int]:
+    """
+    For a specific invite_link_id:
+    - Fetch users in joins table where left_at IS NULL
+    - Check if they are still a participant in the chat
+    - If not, set left_at/left_reason/left_seen_at
+    Returns: (fixed_left_count, checked_count)
+    """
+    # 1) Find the link row to get chat_id
+    rows = sp_list_invite_links(uid)
+    link_row = next((r for r in rows if int(r.get("id", 0)) == int(invite_link_id)), None)
+    if not link_row:
+        return (0, 0)
+
+    chat_id = int(link_row["chat_id"])
+
+    # 2) Get Telethon client
+    uc = await get_user_client(uid)
+    peer = await uc.get_input_entity(chat_id)
+
+    # 3) Fetch a batch of "currently joined" users from DB
+    # left_at null = currently joined (as per DB)
+    # We reconcile only a limited batch to keep it fast.
+    q = (
+        supabase.table("joins")
+        .select("id,joined_user_id,left_at")
+        .eq("user_id", uid)
+        .eq("invite_link_id", invite_link_id)
+        .is_("left_at", None)
+        .limit(batch_limit)
+        .execute()
+    )
+
+    data = q.data or []
+    if not data:
+        return (0, 0)
+
+    fixed = 0
+    checked = 0
+
+    for row in data:
+        checked += 1
+        member_uid = int(row["joined_user_id"])
+        join_row_id = row["id"]
+
+        try:
+            # If still participant => nothing to do
+            await uc(functions.channels.GetParticipantRequest(
+                channel=peer,
+                participant=member_uid
+            ))
+        except UserNotParticipantError:
+            # Not a member anymore => mark left
+            now_iso = datetime.now(timezone.utc).isoformat()
+            supabase.table("joins").update({
+                "left_at": now_iso,
+                "left_reason": "reconciled_left",
+                "left_seen_at": now_iso,
+            }).eq("id", join_row_id).execute()
+            fixed += 1
+
+        except ChatAdminRequiredError:
+            # If account isn't admin, participant check may fail
+            # In that case we cannot reliably reconcile
+            print("Reconcile error: Admin rights required to check participants.")
+            break
+
+        except Exception as ex:
+            # Flood / temporary errors
+            print("Reconcile member check error:", ex)
+
+        # Small delay to avoid Telegram flood
+        await asyncio.sleep(0.2)
+
+    return (fixed, checked)
+
+
+
 async def render_stats_page(event, uid: int, ctx: Dict[str, Any]):
     """
     FAST summary stats only:
@@ -562,6 +644,58 @@ async def help_cmd(e):
     await e.respond(txt, parse_mode="md")
 
 
+# ---------------- RECONCILE LEFT (TELETHON) ----------------
+
+@bot.on(events.NewMessage(pattern=r"^/reconcile_left$"))
+async def reconcile_left_cmd(e):
+    uid = e.sender_id
+    if not await is_logged_in(uid):
+        return await e.respond("🔒 Please `/login` first.", parse_mode="md")
+
+    rows = sp_list_invite_links(uid)
+    if not rows:
+        return await e.respond("❌ No links found. Pehle /create_link se link banao.", parse_mode="md")
+
+    btn_rows: List[List[Button]] = []
+    for r in rows[:10]:
+        title = r.get("chat_title") or f"id:{r.get('chat_id')}"
+        short = (title[:40] + "…") if len(title) > 40 else title
+        btn_rows.append([Button.inline(short, data=f"reconcile_link:{int(r['id'])}".encode())])
+
+    btn_rows.append([Button.inline("✖ Cancel", data=b"reconcile_cancel")])
+
+    await e.respond(
+        "🛠️ **Left Reconcile Mode**\n\nKis link ka left verify karke DB update karna hai? 👇",
+        parse_mode="md",
+        buttons=btn_rows
+    )
+
+
+@bot.on(events.CallbackQuery(pattern=b"^reconcile_link:"))
+async def cb_reconcile_left(event):
+    uid = event.sender_id
+    try:
+        link_id = int(event.data.decode().split(":")[1])
+    except Exception:
+        return await event.answer("Invalid link.", alert=True)
+
+    await event.edit("⏳ Checking Telegram members… (left reconcile running)", buttons=None)
+
+    fixed, checked = await reconcile_left_for_link(uid, link_id, batch_limit=300)
+
+    await event.edit(
+        f"✅ **Reconcile Done**\n\n"
+        f"Checked: `{checked}`\n"
+        f"Marked Left (fixed): `{fixed}`\n\n"
+        f"Tip: Agar users bahut zyada hain toh command dubara run karo (next batch fix ho jayega).",
+        parse_mode="md",
+        buttons=[[Button.inline("✖ Close", data=b"stats_page:close")]]
+    )
+
+
+@bot.on(events.CallbackQuery(pattern=b"^reconcile_cancel$"))
+async def cb_reconcile_cancel(event):
+    await event.edit("✖ Reconcile cancelled.", buttons=None)
 
 
 @bot.on(events.NewMessage(pattern=r"^/status$"))
@@ -1126,7 +1260,8 @@ async def cb_cal_day(event):
         )
 
         # sync (same like /stats)
-        await sync_importers_to_db(uid)
+        await sync_importers_to_db(uid, only_link_id=link_id)
+
 
         # counts
         total = sp_count_joins_for_link(uid, link_id, since=since_utc, until=until_utc)
@@ -1448,15 +1583,68 @@ async def remove_link_cmd(e):
 
 
 # ---------------- SYNC IMPORTERS → JOINS TABLE ----------------
+def extract_invite_hash(full_link: str) -> str:
+    part = (full_link or "").rsplit("/", 1)[-1]
+    part = part.replace("joinchat/", "")
+    part = part.lstrip("+").strip()
+    return part
 
-async def sync_importers_to_db(uid: int):
+
+async def fetch_all_importers(uc, peer, link_hash: str, requested: bool = False) -> list:
     """
-    For each invite_link: fetch Telegram invite importers and refresh joins table.
-    Uses GetChatInviteImporters with proper peer + link hash.
+    Pagination for GetChatInviteImporters so 1000+ joiners can be fetched.
     """
+    all_imps = []
+    offset_date = None
+    offset_user = tl_types.InputUserEmpty()
+    page_limit = 200  # safe batch size
+
+    while True:
+        res = await uc(
+            functions.messages.GetChatInviteImportersRequest(
+                peer=peer,
+                link=link_hash,
+                offset_date=offset_date,
+                offset_user=offset_user,
+                limit=page_limit,
+                requested=requested,
+            )
+        )
+
+        imps = getattr(res, "importers", []) or []
+        if not imps:
+            break
+
+        all_imps.extend(imps)
+
+        if len(imps) < page_limit:
+            break
+
+        last = imps[-1]
+        offset_date = getattr(last, "date", None)
+
+        users = getattr(res, "users", []) or []
+        user_map = {int(u.id): u for u in users if getattr(u, "id", None)}
+
+        last_uid = int(getattr(last, "user_id", 0) or 0)
+        if last_uid and last_uid in user_map and getattr(user_map[last_uid], "access_hash", None):
+            offset_user = types.InputUser(user_id=last_uid, access_hash=user_map[last_uid].access_hash)
+        else:
+            break
+
+    return all_imps
+
+
+async def sync_importers_to_db(uid: int, only_link_id: Optional[int] = None):
     rows = sp_list_invite_links(uid)
     if not rows:
         return
+
+    # ✅ Only selected link sync (fast)
+    if only_link_id is not None:
+        rows = [r for r in rows if int(r.get("id", 0)) == int(only_link_id)]
+        if not rows:
+            return
 
     try:
         uc = await get_user_client(uid)
@@ -1467,115 +1655,50 @@ async def sync_importers_to_db(uid: int):
     for r in rows:
         invite_link_id = int(r["id"])
         chat_id = int(r["chat_id"])
-        full_link = r["invite_link"]
+        full_link = r.get("invite_link") or ""
 
-        # 1) extract hash part
-        link_part = full_link.rsplit("/", 1)[-1]
-        link_part = link_part.lstrip("+").replace("joinchat/", "")
+        link_hash = extract_invite_hash(full_link)
+        if not link_hash:
+            print("sync_importers_to_db: invalid link hash:", full_link)
+            continue
 
         try:
-            # 2) convert chat_id to InputPeer
             peer = await uc.get_input_entity(chat_id)
         except Exception as ex:
             print(f"sync_importers_to_db get_input_entity error for {chat_id}:", ex)
             continue
 
         try:
-            # 3) GetChatInviteImporters call
-            result = await uc(
-                functions.messages.GetChatInviteImportersRequest(
-                    peer=peer,
-                    link=link_part,
-                    offset_date=None,
-                    offset_user=tl_types.InputUserEmpty(),
-                    limit=1000,
-                    requested=False,
-                )
-            )
+            importers = await fetch_all_importers(uc, peer, link_hash, requested=False)
         except Exception as ex:
             print("GetChatInviteImporters error:", ex)
             continue
 
-        importers = getattr(result, "importers", []) or []
         join_rows: List[dict] = []
-
         for imp in importers:
-            try:
-                user_id = int(getattr(imp, "user_id", 0) or 0)
-                if not user_id:
-                    continue
-
-                # -------- NEW: resolve joined_username --------
-                try:
-                    ent = await uc.get_entity(user_id)
-
-                    if getattr(ent, "username", None):
-                        username = "@" + ent.username
-                    elif getattr(ent, "first_name", None) or getattr(ent, "last_name", None):
-                        username = f"{(ent.first_name or '')} {(ent.last_name or '')}".strip()
-                    else:
-                        username = f"id:{user_id}"
-                except Exception:
-                    # if we can't fetch entity, just store id
-                    username = f"id:{user_id}"
-
-                # joined_at time
-                join_date = getattr(imp, "date", None)
-                if isinstance(join_date, datetime):
-                    joined_at = join_date.astimezone(timezone.utc)
-                else:
-                    joined_at = datetime.now(timezone.utc)
-
-                # row to insert
-                join_rows.append(
-                    {
-                        "user_id": uid,  # owner of this link
-                        "chat_id": chat_id,
-                        "invite_link_id": invite_link_id,
-                        "joined_user_id": user_id,
-                        "joined_at": joined_at.isoformat(),
-                    }
-                )
-
-            except Exception as ex:
-                print("importer parse err:", ex)
+            user_id = int(getattr(imp, "user_id", 0) or 0)
+            if not user_id:
                 continue
 
+            join_date = getattr(imp, "date", None)
+            if isinstance(join_date, datetime):
+                joined_at = join_date.astimezone(timezone.utc)
+            else:
+                joined_at = datetime.now(timezone.utc)
+
+            join_rows.append({
+                "user_id": uid,
+                "chat_id": chat_id,
+                "invite_link_id": invite_link_id,
+                "joined_user_id": user_id,
+                "joined_at": joined_at.isoformat(),
+            })
+
+        # ✅ Refresh joins table for this link
         sp_replace_joins_for_link(uid, invite_link_id, join_rows)
 
-        # ✅ LEFT DETECT BLOCK (PASTE HERE)
-        # For each joined_user_id already stored for this link -> check if still member
-        try:
-            existing = (
-                supabase.table("joins")
-                .select("id,joined_user_id,left_at")
-                .eq("user_id", uid)
-                .eq("invite_link_id", invite_link_id)
-                .execute()
-            ).data or []
-
-            for row in existing:
-                if row.get("left_at"):
-                    continue
-
-                member_uid = int(row["joined_user_id"])
-
-                try:
-                    # If user is still in chat, this will succeed
-                    await uc(functions.channels.GetParticipantRequest(
-                        channel=peer,
-                        participant=member_uid
-                    ))
-                except Exception:
-                    # Not in chat anymore -> mark as left
-                    supabase.table("joins").update({
-                        "left_at": datetime.now(timezone.utc).isoformat(),
-                        "left_reason": "left",
-                        "left_seen_at": datetime.now(timezone.utc).isoformat(),
-                    }).eq("id", row["id"]).execute()
-
-        except Exception as ex:
-            print("left-check error:", ex)
+        # ❌ Removed: get_entity() (names not needed)
+        # ❌ Removed: heavy participant left-check (use ChatAction for left)
 
 
 @bot.on(events.ChatAction)
@@ -1709,7 +1832,7 @@ async def cb_stats_link(event):
         "Please wait 2–3 seconds.",
         buttons=None,
     )
-    await sync_importers_to_db(uid)
+    await sync_importers_to_db(uid, only_link_id=link_id)
 
     # Total joins for this link
     total = sp_count_joins_for_link(uid, link_id, since=since, until=until)
