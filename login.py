@@ -650,7 +650,7 @@ async def help_cmd(e):
 async def reconcile_left_cmd(e):
     uid = e.sender_id
     if not await is_logged_in(uid):
-        return await e.respond("🔒 Please `/login` first.", parse_mode="md")
+        return await e.respond("🔒 Please /login first.", parse_mode="md")
 
     rows = sp_list_invite_links(uid)
     if not rows:
@@ -668,6 +668,110 @@ async def reconcile_left_cmd(e):
         "🛠️ **Left Reconcile Mode**\n\nKis link ka left verify karke DB update karna hai? 👇",
         parse_mode="md",
         buttons=btn_rows
+    )
+# ---------------- RECONCILE ALL (CONFIRM + HEAVY PROCESS) ----------------
+
+async def reconcile_left_for_all_links(uid: int, per_link_batch: int = 300) -> tuple[int, int, int]:
+    """
+    Reconcile ALL invite links created by this user.
+    Returns: (total_fixed, total_checked, links_processed)
+    """
+    rows = sp_list_invite_links(uid)
+    if not rows:
+        return (0, 0, 0)
+
+    total_fixed = 0
+    total_checked = 0
+    links_processed = 0
+
+    for r in rows:
+        link_id = int(r.get("id", 0) or 0)
+        if not link_id:
+            continue
+
+        fixed, checked = await reconcile_left_for_link(
+            uid,
+            link_id,
+            batch_limit=per_link_batch
+        )
+
+        total_fixed += fixed
+        total_checked += checked
+        links_processed += 1
+
+        # Small pause to reduce flood / rate-limit risk across multiple links
+        await asyncio.sleep(0.4)
+
+    return (total_fixed, total_checked, links_processed)
+
+
+@bot.on(events.NewMessage(pattern=r"^/reconcile_all$"))
+async def reconcile_all_cmd(e):
+    uid = e.sender_id
+
+    if not await is_logged_in(uid):
+        return await e.respond(
+            "🔒 Please run /login first to continue.",
+            parse_mode="md"
+        )
+
+    rows = sp_list_invite_links(uid)
+    if not rows:
+        return await e.respond(
+            "❌ No invite links found. Please create a link using /create_link first.",
+            parse_mode="md"
+        )
+
+    await e.respond(
+        "⚠️ **Are you sure you want to reconcile ALL your invite links?**\n\n"
+        "This is a **heavy process** and may take a significant amount of time, "
+        "depending on the total number of links you have created.\n\n"
+        "⏳ Please be patient and wait for **a few minutes** until the process completes.\n\n"
+        f"📌 Total links found: `{len(rows)}`",
+        parse_mode="md",
+        buttons=[
+            [
+                Button.inline("✖ NO", data=b"reconcile_all_no"),
+                Button.inline("✅🔁 Reconcile Now", data=b"reconcile_all_yes"),
+            ]
+        ],
+    )
+
+
+@bot.on(events.CallbackQuery(pattern=b"^reconcile_all_no$"))
+async def cb_reconcile_all_no(event):
+    await event.edit(
+        "✖ Operation cancelled. Reconcile all process has been stopped.",
+        buttons=None
+    )
+
+
+@bot.on(events.CallbackQuery(pattern=b"^reconcile_all_yes$"))
+async def cb_reconcile_all_yes(event):
+    uid = event.sender_id
+
+    await event.edit(
+        "⏳ **Reconciling all your invite links…**\n\n"
+        "Please wait for a few minutes.\n"
+        "This process may take longer if you have created many links.",
+        parse_mode="md",
+        buttons=None,
+    )
+
+    total_fixed, total_checked, links_processed = await reconcile_left_for_all_links(
+        uid,
+        per_link_batch=400
+    )
+
+    await event.edit(
+        "✅ **Reconcile All Completed Successfully**\n\n"
+        f"🔗 Links processed: `{links_processed}`\n"
+        f"👤 Users checked: `{total_checked}`\n"
+        f"🚪 Left users fixed (marked as left): `{total_fixed}`\n\n"
+        "ℹ️ Tip: If you have a very large number of users, you can run /reconcile_all again "
+        "to continue reconciling the next batches.",
+        parse_mode="md",
+        buttons=[[Button.inline("✖ Close", data=b"stats_page:close")]],
     )
 
 
@@ -1072,7 +1176,7 @@ async def logout_cancel_cb(event):
 @bot.on(events.NewMessage(pattern=r"^/create_link$"))
 async def create_link_cmd(e):
     if not await is_logged_in(e.sender_id):
-        return await e.respond("🔒 Please `/login` first.", parse_mode="md")
+        return await e.respond("🔒 Please /login first.", parse_mode="md")
     # premium check
     
 
@@ -1097,7 +1201,7 @@ async def create_link_cmd(e):
 async def select_date_cmd(e):
     uid = e.sender_id
     if not await is_logged_in(uid):
-        return await e.respond("🔒 Please `/login` first.", parse_mode="md")
+        return await e.respond("🔒 Please /login first.", parse_mode="md")
 
     rows = sp_list_invite_links(uid)
     if not rows:
@@ -1532,7 +1636,7 @@ async def cb_msel_cancel(event):
 async def links_cmd(e):
     uid = e.sender_id
     if not await is_logged_in(uid):
-        return await e.respond("🔒 Please `/login` first.", parse_mode="md")
+        return await e.respond("🔒 Please /login first.", parse_mode="md")
     rows = sp_list_invite_links(uid)
     if not rows:
         return await e.respond(
@@ -1558,7 +1662,7 @@ async def links_cmd(e):
 async def remove_link_cmd(e):
     uid = e.sender_id
     if not await is_logged_in(uid):
-        return await e.respond("🔒 Please `/login` first.", parse_mode="md")
+        return await e.respond("🔒 Please /login first.", parse_mode="md")
     rows = sp_list_invite_links(uid)
     if not rows:
         return await e.respond("ℹ️ No active links to remove.", parse_mode="md")
@@ -1775,7 +1879,7 @@ async def _stats_template(
     """Ask user which invite_link they want stats for."""
     uid = e.sender_id
     if not await is_logged_in(uid):
-        return await e.respond("🔒 Please `/login` first.", parse_mode="md")
+        return await e.respond("🔒 Please /login first.",parse_mode="md")
     
 
     rows = sp_list_invite_links(uid)
@@ -1806,6 +1910,14 @@ async def _stats_template(
         parse_mode="md",
         buttons=btn_rows,
     )
+
+@bot.on(events.CallbackQuery(pattern=b"^close_msg$"))
+async def cb_close_msg(event):
+    # Option 1: delete the message
+    await event.delete()
+
+    # Option 2 (if you prefer edit):
+    # await event.edit("✖ Closed.", buttons=None)
 
 
 @bot.on(events.CallbackQuery(pattern=b"^stats:"))
@@ -1929,7 +2041,7 @@ async def stats_all_cmd(e):
 async def yesterday_status_cmd(e):
     uid = e.sender_id
     if not await is_logged_in(uid):
-        return await e.respond("🔒 Please `/login` first.", parse_mode="md")
+        return await e.respond("🔒 Please /login first.", parse_mode="md")
 
     IST = timezone(timedelta(hours=5, minutes=30))
     now_ist = datetime.now(IST)
@@ -1963,7 +2075,7 @@ async def stats_today_cmd(e):
 async def yesterday_status_cmd(e):
     uid = e.sender_id
     if not await is_logged_in(uid):
-        return await e.respond("🔒 Please `/login` first.", parse_mode="md")
+        return await e.respond("🔒 Please /login first.", parse_mode="md")
 
     IST = timezone(timedelta(hours=5, minutes=30))
     now_ist = datetime.now(IST)
