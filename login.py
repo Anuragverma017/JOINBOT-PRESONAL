@@ -1094,7 +1094,7 @@ async def cb_menu_links(event):
 @bot.on(events.CallbackQuery(pattern=b"menu_stats"))
 async def cb_menu_stats(event):
     await event.answer()
-    await event.respond("📊 Joins ka stats dekhne ke liye:\n\n`/stats`\n\nYa jo bhi tumne stats wali command rakhi hai (agar naam alag hai to yahan update kar lena).", parse_mode="md")
+    await event.respond("📊 Joins ka stats dekhne ke liye:\n\n/stats\n\nYa jo bhi tumne stats wali command rakhi hai (agar naam alag hai to yahan update kar lena).", parse_mode="md")
 
 
 
@@ -1686,34 +1686,47 @@ async def remove_link_cmd(e):
     )
 
 
-# ---------------- SYNC IMPORTERS → JOINS TABLE ----------------
+# ---------------- SYNC IMPORTERS → JOINS TABLE (FIXED) ----------------
+from telethon.errors import FloodWaitError
+import asyncio
+from datetime import datetime, timezone
+from typing import Optional, List, Dict
+
 def extract_invite_hash(full_link: str) -> str:
     part = (full_link or "").rsplit("/", 1)[-1]
     part = part.replace("joinchat/", "")
     part = part.lstrip("+").strip()
     return part
 
-
 async def fetch_all_importers(uc, peer, link_hash: str, requested: bool = False) -> list:
     """
-    Pagination for GetChatInviteImporters so 1000+ joiners can be fetched.
+    Fetch ALL importers via pagination.
+    - FloodWait safe
+    - If access_hash missing, continue date-based pagination (don't break)
     """
     all_imps = []
     offset_date = None
     offset_user = tl_types.InputUserEmpty()
-    page_limit = 200  # safe batch size
+    page_limit = 200  # safe
 
     while True:
-        res = await uc(
-            functions.messages.GetChatInviteImportersRequest(
-                peer=peer,
-                link=link_hash,
-                offset_date=offset_date,
-                offset_user=offset_user,
-                limit=page_limit,
-                requested=requested,
+        try:
+            res = await uc(
+                functions.messages.GetChatInviteImportersRequest(
+                    peer=peer,
+                    link=link_hash,
+                    offset_date=offset_date,
+                    offset_user=offset_user,
+                    limit=page_limit,
+                    requested=requested,
+                )
             )
-        )
+        except FloodWaitError as fw:
+            await asyncio.sleep(fw.seconds + 5)
+            continue
+        except Exception as ex:
+            print("fetch_all_importers error:", ex)
+            break
 
         imps = getattr(res, "importers", []) or []
         if not imps:
@@ -1731,144 +1744,213 @@ async def fetch_all_importers(uc, peer, link_hash: str, requested: bool = False)
         user_map = {int(u.id): u for u in users if getattr(u, "id", None)}
 
         last_uid = int(getattr(last, "user_id", 0) or 0)
+
+        # If access_hash exists, use it
         if last_uid and last_uid in user_map and getattr(user_map[last_uid], "access_hash", None):
             offset_user = types.InputUser(user_id=last_uid, access_hash=user_map[last_uid].access_hash)
         else:
-            break
+            # IMPORTANT: continue with date-based pagination
+            offset_user = tl_types.InputUserEmpty()
 
     return all_imps
 
 
-async def sync_importers_to_db(uid: int, only_link_id: Optional[int] = None):
+# ✅ NEW RPC caller (upsert only, never delete)
+def sp_upsert_joins_for_link(uid: int, invite_link_id: int, join_rows: List[dict]) -> int:
+    """
+    Returns inserted/updated count (best effort).
+    Requires SQL RPC: upsert_joins_for_link
+    """
+    if not join_rows:
+        return 0
+    resp = supabase.rpc(
+        "upsert_joins_for_link",
+        {
+            "p_user_id": int(uid),
+            "p_invite_link_id": int(invite_link_id),
+            "p_rows": join_rows,
+        },
+    ).execute()
+    # resp.data may return count depending on your RPC implementation
+    try:
+        return int(resp.data or 0)
+    except Exception:
+        return 0
+
+
+async def sync_importers_to_db(uid: int, only_link_id: Optional[int] = None) -> Dict[int, int]:
+    """
+    Sync from Telegram -> DB
+    Returns dict: {invite_link_id: upserted_count}
+    """
     rows = sp_list_invite_links(uid)
     if not rows:
-        return
+        return {}
 
-    # ✅ Only selected link sync (fast)
     if only_link_id is not None:
         rows = [r for r in rows if int(r.get("id", 0)) == int(only_link_id)]
         if not rows:
-            return
+            return {}
 
     try:
         uc = await get_user_client(uid)
     except Exception as ex:
         print("sync_importers_to_db error (get_user_client):", ex)
-        return
+        return {}
+
+    results = {}
 
     for r in rows:
         invite_link_id = int(r["id"])
         chat_id = int(r["chat_id"])
         full_link = r.get("invite_link") or ""
+        link_type = (r.get("link_type") or "normal").lower()  # normal / approval
 
         link_hash = extract_invite_hash(full_link)
         if not link_hash:
             print("sync_importers_to_db: invalid link hash:", full_link)
+            results[invite_link_id] = 0
             continue
 
         try:
             peer = await uc.get_input_entity(chat_id)
         except Exception as ex:
             print(f"sync_importers_to_db get_input_entity error for {chat_id}:", ex)
+            results[invite_link_id] = 0
             continue
 
+        # ✅ approval links: fetch BOTH and merge
         try:
-            importers = await fetch_all_importers(uc, peer, link_hash, requested=False)
+            importers_normal = await fetch_all_importers(uc, peer, link_hash, requested=False)
+
+            importers_requested = []
+            if link_type == "approval":
+                importers_requested = await fetch_all_importers(uc, peer, link_hash, requested=True)
+
+            merged: Dict[int, datetime] = {}
+            for imp in (importers_normal + importers_requested):
+                joined_user_id = int(getattr(imp, "user_id", 0) or 0)
+                if not joined_user_id:
+                    continue
+
+                join_date = getattr(imp, "date", None)
+                if isinstance(join_date, datetime):
+                    joined_at = join_date.astimezone(timezone.utc)
+                else:
+                    joined_at = datetime.now(timezone.utc)
+
+                prev = merged.get(joined_user_id)
+                if (prev is None) or (joined_at < prev):
+                    merged[joined_user_id] = joined_at
+
         except Exception as ex:
             print("GetChatInviteImporters error:", ex)
+            results[invite_link_id] = 0
             continue
 
         join_rows: List[dict] = []
-        for imp in importers:
-            user_id = int(getattr(imp, "user_id", 0) or 0)
-            if not user_id:
-                continue
-
-            join_date = getattr(imp, "date", None)
-            if isinstance(join_date, datetime):
-                joined_at = join_date.astimezone(timezone.utc)
-            else:
-                joined_at = datetime.now(timezone.utc)
-
-            join_rows.append({
-                "user_id": uid,
-                "chat_id": chat_id,
-                "invite_link_id": invite_link_id,
-                "joined_user_id": user_id,
-                "joined_at": joined_at.isoformat(),
-            })
-
-        # ✅ Refresh joins table for this link
-        sp_replace_joins_for_link(uid, invite_link_id, join_rows)
-
-        # ❌ Removed: get_entity() (names not needed)
-        # ❌ Removed: heavy participant left-check (use ChatAction for left)
-
-
-@bot.on(events.ChatAction)
-async def track_user_left(e: events.ChatAction.Event):
-    """
-    Detect when a user leaves or is kicked from a tracked chat
-    and mark left_at in joins table.
-    """
-    try:
-        if not e.chat_id or not e.user_id:
-            return
-
-        # Sirf leave / kick cases
-        if not (e.user_left or e.user_kicked):
-            return
-
-        chat_id = int(e.chat_id)
-        joined_user_id = int(e.user_id)
-        reason = "kicked" if e.user_kicked else "left"
-
-        # Kaun-kaun owner is chat ko track kar raha hai
-        res = (
-            supabase.table("invite_links")
-            .select("user_id")
-            .eq("chat_id", chat_id)
-            .eq("is_active", True)
-            .execute()
-        )
-        owners = list({int(r["user_id"]) for r in (res.data or [])})
-
-        if not owners:
-            return
-
-        for uid in owners:
-            # latest join row ko left mark karo
-            jr = (
-                supabase.table("joins")
-                .select("id,left_at")
-                .eq("user_id", uid)
-                .eq("chat_id", chat_id)
-                .eq("joined_user_id", joined_user_id)
-                .order("joined_at", desc=True)
-                .limit(1)
-                .execute()
+        for joined_user_id, joined_at in merged.items():
+            join_rows.append(
+                {
+                    "user_id": int(uid),
+                    "chat_id": int(chat_id),
+                    "invite_link_id": int(invite_link_id),
+                    "joined_user_id": int(joined_user_id),
+                    "joined_at": joined_at.isoformat(),
+                }
             )
 
-            if not jr.data:
-                continue
+        # ✅ IMPORTANT FIX: UPSERT ONLY (never delete)
+        upserted = sp_upsert_joins_for_link(uid, invite_link_id, join_rows)
+        results[invite_link_id] = upserted
 
-            row = jr.data[0]
-            if row.get("left_at"):
-                continue
+        # tiny delay (safer for Telegram rate limits)
+        await asyncio.sleep(0.3)
 
-            supabase.table("joins").update(
-                {
-                    "left_at": datetime.now(timezone.utc).isoformat(),
-                    "left_reason": reason,
-                    "left_seen_at": datetime.now(timezone.utc).isoformat(),
-                }
-            ).eq("id", row["id"]).execute()
+    return results
 
+
+# ---------------- COMMANDS ----------------
+
+@bot.on(events.NewMessage(pattern=r"^/sync_joins$"))
+async def cmd_sync_joins(e):
+    uid = e.sender_id
+    if not await is_logged_in(uid):
+        return await e.respond("🔒 Please /login first.", parse_mode="md")
+
+    await e.respond("⏳ Syncing join data from Telegram → DB (this may take some time)...")
+
+    res = await sync_importers_to_db(uid, only_link_id=None)
+
+    if not res:
+        return await e.respond("⚠️ No links found to sync. Use /create_link first.")
+
+    done = sum(res.values())
+    lines = [f"✅ Synced links: `{len(res)}`", f"➕ Added/Updated rows: `{done}`"]
+    await e.respond("\n".join(lines), parse_mode="md")
+
+
+@bot.on(events.NewMessage(pattern=r"^/sync_all_links$"))
+async def cmd_sync_all_links(e):
+    uid = e.sender_id
+    if not await is_logged_in(uid):
+        return await e.respond("🔒 Please /login first.", parse_mode="md")
+
+    rows = sp_list_invite_links(uid)
+    if not rows:
+        return await e.respond("⚠️ No links found. Use /create_link first.")
+
+    await e.respond(f"⏳ Syncing ALL links (`{len(rows)}`) from Telegram → DB... (night run recommended)")
+
+    total = 0
+    ok = 0
+
+    for r in rows:
+        link_id = int(r["id"])
+        title = r.get("chat_title") or f"id:{r.get('chat_id')}"
+        try:
+            res = await sync_importers_to_db(uid, only_link_id=link_id)
+            added = res.get(link_id, 0)
+            total += added
+            ok += 1
+            await e.respond(f"✅ `{title}` → +`{added}`")
+        except FloodWaitError as fw:
+            await e.respond(f"⏳ FloodWait `{fw.seconds}s` for `{title}`. Waiting...")
+            await asyncio.sleep(fw.seconds + 5)
+        except Exception as ex:
+            await e.respond(f"❌ `{title}` sync failed: `{ex}`")
+
+        await asyncio.sleep(0.6)
+
+    await e.respond(f"✅ Done. Links synced: `{ok}/{len(rows)}` | Total upserted: `{total}`", parse_mode="md")
+
+
+@bot.on(events.CallbackQuery(pattern=b"^sync_one:"))
+async def cb_sync_one(event):
+    uid = event.sender_id
+    link_id = int(event.data.decode().split(":")[1])
+
+    await event.edit("⏳ Syncing joins from Telegram…\nPlease wait.", buttons=None)
+
+    try:
+        await sync_importers_to_db(uid, only_link_id=link_id)
+        await event.edit(
+            "✅ **Sync completed successfully**\n\n"
+            "Now /stats will show accurate data.",
+            parse_mode="md",
+            buttons=[[Button.inline("✖ Close", data=b"stats_page:close")]]
+        )
+    except FloodWaitError as fw:
+        await asyncio.sleep(fw.seconds + 5)
+        await event.edit("⚠️ Telegram rate-limit hit. Try again later.")
     except Exception as ex:
-        print("track_user_left error:", ex)
+        await event.edit(f"❌ Sync failed: `{ex}`", parse_mode="md")
 
 
-# ---------------- STATS COMMANDS (PER LINK, WITH SELECTION) ----------------
+@bot.on(events.CallbackQuery(pattern=b"^sync_cancel$"))
+async def cb_sync_cancel(event):
+    await event.edit("✖ Sync cancelled.", buttons=None)
+
 
 async def _stats_template(
     e,
