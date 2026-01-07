@@ -11,6 +11,8 @@ from telethon import TelegramClient, events, errors, Button
 from telethon import types as tl_types  # for User/Chat/Channel/UpdateBotChatInviteRequester, InputUserEmpty
 from telethon.tl import functions, types
 from telethon.utils import get_peer_id
+import logging
+from error_handler import safe_event_handler, log_info, log_error, log_warning
 # ---------------- ENV & GLOBALS ----------------
 
 load_dotenv()
@@ -181,8 +183,12 @@ def multi_kb(n: int, selected: Set[int]) -> List[List[Button]]:
 
 
 def sp_get_session(uid: int) -> Optional[dict]:
-    res = supabase.table("user_sessions").select("*").eq("user_id", uid).limit(1).execute()
-    return res.data[0] if res.data else None
+    try:
+        res = supabase.table("user_sessions").select("*").eq("user_id", uid).limit(1).execute()
+        return res.data[0] if res.data else None
+    except Exception as e:
+        log_error(f"sp_get_session error for uid {uid}: {e}")
+        return None
 
 
 def sp_upsert_session(uid: int, phone: str, session_file: str):
@@ -193,18 +199,32 @@ def sp_upsert_session(uid: int, phone: str, session_file: str):
         "is_active": True,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    try:
-        supabase.table("user_sessions").upsert(payload, on_conflict="user_id").execute()
-    except Exception:
-        existing = supabase.table("user_sessions").select("user_id").eq("user_id", uid).limit(1).execute()
-        if existing and existing.data:
-            supabase.table("user_sessions").update(payload).eq("user_id", uid).execute()
-        else:
-            supabase.table("user_sessions").insert(payload).execute()
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            supabase.table("user_sessions").upsert(payload, on_conflict="user_id").execute()
+            return
+        except Exception as e:
+            if attempt < max_retries - 1:
+                log_warning(f"sp_upsert_session retry {attempt + 1}/{max_retries}: {e}")
+                continue
+            log_error(f"sp_upsert_session failed after {max_retries} attempts: {e}")
+            # Fallback: try update/insert separately
+            try:
+                existing = supabase.table("user_sessions").select("user_id").eq("user_id", uid).limit(1).execute()
+                if existing and existing.data:
+                    supabase.table("user_sessions").update(payload).eq("user_id", uid).execute()
+                else:
+                    supabase.table("user_sessions").insert(payload).execute()
+            except Exception as fallback_error:
+                log_error(f"sp_upsert_session fallback also failed: {fallback_error}")
 
 
 def sp_delete_session(uid: int):
-    supabase.table("user_sessions").delete().eq("user_id", uid).execute()
+    try:
+        supabase.table("user_sessions").delete().eq("user_id", uid).execute()
+    except Exception as e:
+        log_error(f"sp_delete_session error for uid {uid}: {e}")
 
 
 def sp_save_invite_link(
@@ -460,7 +480,9 @@ async def reconcile_left_for_link(uid: int, invite_link_id: int, batch_limit: in
 
         except Exception as ex:
             # Flood / temporary errors
-            print("Reconcile member check error:", ex)
+            # Silently skip - these are expected (deleted accounts, privacy restrictions)
+            # Uncomment below to debug: print("Reconcile member check error:", ex)
+            pass
 
         # Small delay to avoid Telegram flood
         await asyncio.sleep(0.2)
@@ -1725,7 +1747,8 @@ async def fetch_all_importers(uc, peer, link_hash: str, requested: bool = False)
             await asyncio.sleep(fw.seconds + 5)
             continue
         except Exception as ex:
-            print("fetch_all_importers error:", ex)
+            # Silently skip - expired links are expected
+            # Uncomment to debug: print("fetch_all_importers error:", ex)
             break
 
         imps = getattr(res, "importers", []) or []
@@ -2193,18 +2216,7 @@ async def stats_year_cmd(e):
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=365)
     await _stats_template(e, "Last 365 days", since=start)
-
-
-# ---------------- UPGRADE & PLAN CALLBACKS ----------------
-
-# ---------------- UPGRADE & PLAN CALLBACKS ----------------
-#  GetAIPilot plans UI + Razorpay Pay/Verify flow
-#  (AutoForward bot = main product, Join + AutoApprove free with any plan)
-# ---------------------------------------------------------
-
-
-# ---------------- BOT PROFILE (DESCRIPTION + COMMANDS) ----------------
-
+    
 async def setup_bot_profile():
     """Set bot description + commands list."""
     try:
@@ -2252,10 +2264,55 @@ async def setup_bot_profile():
 # ---------------- RUN ----------------
 
 if __name__ == "__main__":
-    print("🤖 Join Counter Bot ready!")
-    loop = asyncio.get_event_loop()
-    try:
-        loop.run_until_complete(setup_bot_profile())
-    except Exception as e:
-        print("setup_bot_profile error:", e)
-    bot.run_until_disconnected()
+    log_info("🤖 Join Counter Bot starting...")
+    
+    # Auto-reconnect loop to prevent crashes
+    max_retries = 0  # Infinite retries (0 = unlimited)
+    retry_count = 0
+    base_delay = 5  # Start with 5 seconds
+    max_delay = 300  # Max 5 minutes between retries
+    
+    while True:
+        try:
+            log_info("Initializing bot profile...")
+            loop = asyncio.get_event_loop()
+            try:
+                loop.run_until_complete(setup_bot_profile())
+                log_info("✅ Bot profile setup complete")
+            except Exception as e:
+                log_warning(f"Profile setup failed (non-critical): {e}")
+            
+            log_info("🤖 Join Counter Bot ready! Starting main loop...")
+            retry_count = 0  # Reset retry count on successful start
+            
+            # Main bot loop
+            bot.run_until_disconnected()
+            
+            # If we reach here, bot disconnected gracefully
+            log_info("Bot disconnected gracefully. Exiting.")
+            break
+            
+        except KeyboardInterrupt:
+            log_info("🛑 Bot stopped by user (Ctrl+C)")
+            break
+            
+        except Exception as e:
+            retry_count += 1
+            log_error(f"❌ Bot crashed: {type(e).__name__}: {e}", exc_info=True)
+            
+            # Calculate delay with exponential backoff
+            if max_retries > 0 and retry_count >= max_retries:
+                log_error(f"Max retries ({max_retries}) reached. Exiting.")
+                break
+            
+            delay = min(base_delay * (2 ** (retry_count - 1)), max_delay)
+            log_info(f"🔄 Restarting bot in {delay} seconds... (attempt {retry_count})")
+            
+            try:
+                asyncio.run(asyncio.sleep(delay))
+            except KeyboardInterrupt:
+                log_info("🛑 Bot stopped during restart delay")
+                break
+    
+    log_info("Bot shutdown complete.")
+
